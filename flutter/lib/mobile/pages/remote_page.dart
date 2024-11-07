@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -37,12 +38,15 @@ class RemotePage extends StatefulWidget {
   State<RemotePage> createState() => _RemotePageState(id);
 }
 
-class _RemotePageState extends State<RemotePage> {
+class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   Timer? _timer;
   bool _showBar = !isWebDesktop;
   bool _showGestureHelp = false;
   String _value = '';
   Orientation? _currentOrientation;
+  double _viewInsetsBottom = 0;
+
+  Timer? _timerDidChangeMetrics;
 
   final _blockableOverlayState = BlockableOverlayState();
 
@@ -89,10 +93,19 @@ class _RemotePageState extends State<RemotePage> {
     gFFI.chatModel
         .changeCurrentKey(MessageKey(widget.id, ChatModel.clientModeID));
     _blockableOverlayState.applyFfi(gFFI);
+    gFFI.imageModel.addCallbackOnFirstImage((String peerId) {
+      gFFI.recordingModel
+          .updateStatus(bind.sessionGetIsRecording(sessionId: gFFI.sessionId));
+      if (gFFI.recordingModel.start) {
+        showToast(translate('Automatically record outgoing sessions'));
+      }
+    });
+    WidgetsBinding.instance.addObserver(this);
   }
 
   @override
   Future<void> dispose() async {
+    WidgetsBinding.instance.removeObserver(this);
     // https://github.com/flutter/flutter/issues/64935
     super.dispose();
     gFFI.dialogManager.hideMobileActionsOverlay(store: false);
@@ -104,6 +117,7 @@ class _RemotePageState extends State<RemotePage> {
     _physicalFocusNode.dispose();
     await gFFI.close();
     _timer?.cancel();
+    _timerDidChangeMetrics?.cancel();
     gFFI.dialogManager.dismissAll();
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
         overlays: SystemUiOverlay.values);
@@ -116,6 +130,19 @@ class _RemotePageState extends State<RemotePage> {
     // The inner logic of `on_voice_call_closed` will check if the voice call is active.
     // Only one client is considered here for now.
     gFFI.chatModel.onVoiceCallClosed("End connetion");
+  }
+
+  @override
+  void didChangeMetrics() {
+    final newBottom = MediaQueryData.fromView(ui.window).viewInsets.bottom;
+    _timerDidChangeMetrics?.cancel();
+    _timerDidChangeMetrics = Timer(Duration(milliseconds: 100), () async {
+      // We need this comparation because poping up the floating action will also trigger `didChangeMetrics()`.
+      if (newBottom != _viewInsetsBottom) {
+        gFFI.canvasModel.mobileFocusCanvasCursor();
+        _viewInsetsBottom = newBottom;
+      }
+    });
   }
 
   // to-do: It should be better to use transparent color instead of the bgColor.
@@ -155,9 +182,9 @@ class _RemotePageState extends State<RemotePage> {
     var oldValue = _value;
     _value = newValue;
     var i = newValue.length - 1;
-    for (; i >= 0 && newValue[i] != '\1'; --i) {}
+    for (; i >= 0 && newValue[i] != '1'; --i) {}
     var j = oldValue.length - 1;
-    for (; j >= 0 && oldValue[j] != '\1'; --j) {}
+    for (; j >= 0 && oldValue[j] != '1'; --j) {}
     if (i < j) j = i;
     var subNewValue = newValue.substring(j + 1);
     var subOldValue = oldValue.substring(j + 1);
@@ -206,8 +233,8 @@ class _RemotePageState extends State<RemotePage> {
     _value = newValue;
     if (oldValue.isNotEmpty &&
         newValue.isNotEmpty &&
-        oldValue[0] == '\1' &&
-        newValue[0] != '\1') {
+        oldValue[0] == '1' &&
+        newValue[0] != '1') {
       // clipboard
       oldValue = '';
     }
@@ -242,10 +269,14 @@ class _RemotePageState extends State<RemotePage> {
     }
   }
 
-  // handle mobile virtual keyboard
-  void handleSoftKeyboardInput(String newValue) {
+  Future<void> handleSoftKeyboardInput(String newValue) async {
     if (isIOS) {
-      _handleIOSSoftKeyboardInput(newValue);
+      // fix: TextFormField onChanged event triggered multiple times when Korean input
+      // https://github.com/rustdesk/rustdesk/pull/9644
+      await Future.delayed(const Duration(milliseconds: 10));
+
+      if (newValue != _textController.text) return;
+      _handleIOSSoftKeyboardInput(_textController.text);
     } else {
       _handleNonIOSSoftKeyboardInput(newValue);
     }
@@ -511,7 +542,9 @@ class _RemotePageState extends State<RemotePage> {
               right: 10,
               child: QualityMonitor(gFFI.qualityMonitorModel),
             ),
-            KeyHelpTools(requestShow: (keyboardIsVisible || _showGestureHelp)),
+            KeyHelpTools(
+                keyboardIsVisible: keyboardIsVisible,
+                showGestureHelp: _showGestureHelp),
             SizedBox(
               width: 0,
               height: 0,
@@ -740,10 +773,14 @@ class _RemotePageState extends State<RemotePage> {
 }
 
 class KeyHelpTools extends StatefulWidget {
-  /// need to show by external request, etc [keyboardIsVisible] or [changeTouchMode]
-  final bool requestShow;
+  final bool keyboardIsVisible;
+  final bool showGestureHelp;
 
-  KeyHelpTools({required this.requestShow});
+  /// need to show by external request, etc [keyboardIsVisible] or [changeTouchMode]
+  bool get requestShow => keyboardIsVisible || showGestureHelp;
+
+  KeyHelpTools(
+      {required this.keyboardIsVisible, required this.showGestureHelp});
 
   @override
   State<KeyHelpTools> createState() => _KeyHelpToolsState();
@@ -788,7 +825,8 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
       final size = renderObject.size;
       Offset pos = renderObject.localToGlobal(Offset.zero);
       gFFI.cursorModel.keyHelpToolsVisibilityChanged(
-          Rect.fromLTWH(pos.dx, pos.dy, size.width, size.height));
+          Rect.fromLTWH(pos.dx, pos.dy, size.width, size.height),
+          widget.keyboardIsVisible);
     }
   }
 
@@ -800,7 +838,8 @@ class _KeyHelpToolsState extends State<KeyHelpTools> {
         inputModel.command;
 
     if (!_pin && !hasModifierOn && !widget.requestShow) {
-      gFFI.cursorModel.keyHelpToolsVisibilityChanged(null);
+      gFFI.cursorModel
+          .keyHelpToolsVisibilityChanged(null, widget.keyboardIsVisible);
       return Offstage();
     }
     final size = MediaQuery.of(context).size;
@@ -937,11 +976,11 @@ class ImagePaint extends StatelessWidget {
   Widget build(BuildContext context) {
     final m = Provider.of<ImageModel>(context);
     final c = Provider.of<CanvasModel>(context);
-    final adjust = gFFI.cursorModel.adjustForKeyboard();
     var s = c.scale;
+    final adjust = c.getAdjustY();
     return CustomPaint(
       painter: ImagePainter(
-          image: m.image, x: c.x / s, y: (c.y - adjust) / s, scale: s),
+          image: m.image, x: c.x / s, y: (c.y + adjust) / s, scale: s),
     );
   }
 }
@@ -955,7 +994,6 @@ class CursorPaint extends StatelessWidget {
     final m = Provider.of<CursorModel>(context);
     final c = Provider.of<CanvasModel>(context);
     final ffiModel = Provider.of<FfiModel>(context);
-    final adjust = gFFI.cursorModel.adjustForKeyboard();
     final s = c.scale;
     double hotx = m.hotx;
     double hoty = m.hoty;
@@ -987,11 +1025,12 @@ class CursorPaint extends StatelessWidget {
       factor = s / mins;
     }
     final s2 = s < mins ? mins : s;
+    final adjust = c.getAdjustY();
     return CustomPaint(
       painter: ImagePainter(
           image: image,
           x: (m.x - hotx) * factor + c.x / s2,
-          y: (m.y - hoty) * factor + (c.y - adjust) / s2,
+          y: (m.y - hoty) * factor + (c.y + adjust) / s2,
           scale: s2),
     );
   }
